@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import { chatGptConversationKey } from "../src/adapters/chatgpt-web/conversation-key";
 import {
   availableChatGptWebModelRoutes,
   CHATGPT_WEB_BACKEND_MODEL,
   CHATGPT_WEB_LUNA_BACKEND_MODEL,
   CHATGPT_WEB_LUNA_MODEL_ROUTE,
+  CHATGPT_WEB_LUNA_MODEL_ROUTES,
+  CHATGPT_WEB_LUNA_THINK_MODEL_ROUTE,
   CHATGPT_WEB_MODEL_ROUTES,
   requireChatGptWebModelRoute,
   resolveChatGptWebContextLimits,
@@ -53,11 +56,13 @@ describe("fixed ChatGPT Web model routes", () => {
       .toThrow("Pro is not available for this account");
   });
 
-  test("exposes only Luna when the authenticated account has no Sol selector", () => {
+  test("exposes Luna and Think when the authenticated account has no Sol selector", () => {
     const free = { solAvailable: false, proAvailable: false };
-    expect(availableChatGptWebModelRoutes(free)).toEqual([CHATGPT_WEB_LUNA_MODEL_ROUTE]);
+    expect(availableChatGptWebModelRoutes(free)).toEqual(CHATGPT_WEB_LUNA_MODEL_ROUTES);
     expect(requireChatGptWebModelRoute("chatgpt-web/luna", free).backendModel)
       .toBe(CHATGPT_WEB_LUNA_BACKEND_MODEL);
+    expect(requireChatGptWebModelRoute("chatgpt-web/think", free))
+      .toBe(CHATGPT_WEB_LUNA_THINK_MODEL_ROUTE);
     expect(() => requireChatGptWebModelRoute("chatgpt-web/light", free))
       .toThrow("Luna-only account");
     expect(() => requireChatGptWebModelRoute("chatgpt-web/luna", {
@@ -178,17 +183,28 @@ describe("fixed ChatGPT Web model routes", () => {
       .toThrow("model is not enabled");
   });
 
-  test("keeps normal Pro turns on Pro and routes only Pro compaction through Extra High", () => {
+  test("keeps Pro compaction on the same retained Pro conversation", () => {
     const config = defaultConfig("full");
     config.proAvailable = true;
     const normal = parsed("chatgpt-web/pro", "low");
     const compact = parsed("chatgpt-web/pro", "low");
+    const metadata = {
+      "x-codex-turn-metadata": JSON.stringify({ thread_id: "thread_pro_compaction" }),
+    };
+    normal._rawBody = {
+      model: "chatgpt-web/pro",
+      reasoning: { effort: "low" },
+      client_metadata: metadata,
+    };
+    compact._rawBody = structuredClone(normal._rawBody);
     compact._compactionRequest = true;
 
     expect(routeChatGptWebRequest(normal, config).slug).toBe("chatgpt-web/pro");
     expect(normal.options.reasoning).toBe("max");
     expect(routeChatGptWebRequest(compact, config).slug).toBe("chatgpt-web/pro");
-    expect(compact.options.reasoning).toBe("xhigh");
+    expect(compact.options.reasoning).toBe("max");
+    expect(chatGptConversationKey(compact, "provider"))
+      .toBe(chatGptConversationKey(normal, "provider"));
   });
 
   test("binds the Luna route to Luna without a selectable effort", () => {
@@ -199,5 +215,15 @@ describe("fixed ChatGPT Web model routes", () => {
     expect(route).toBe(CHATGPT_WEB_LUNA_MODEL_ROUTE);
     expect(request.modelId).toBe(CHATGPT_WEB_LUNA_BACKEND_MODEL);
     expect(request.options.reasoning).toBe("low");
+  });
+
+  test("binds the Think route to the Luna backend with explicit Think mode", () => {
+    const config = defaultConfig("browser-only");
+    config.solAvailable = false;
+    const request = parsed("chatgpt-web/think", "high");
+    const route = routeChatGptWebRequest(request, config);
+    expect(route).toBe(CHATGPT_WEB_LUNA_THINK_MODEL_ROUTE);
+    expect(request.modelId).toBe(CHATGPT_WEB_LUNA_BACKEND_MODEL);
+    expect(request.options.reasoning).toBe("medium");
   });
 });
