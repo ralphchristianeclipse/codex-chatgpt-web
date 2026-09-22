@@ -6,7 +6,7 @@ import { existsSync, rmSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { stdin, stdout } from "node:process";
 import { captureSystemBrowserLoginToFile, checkBrowserEngine, loginToChatGpt } from "./browser-login";
-import { CHATGPT_CONNECTOR_NAME, defaultConfig, getConfigDir, getConfigPath, loadConfig, loadConfigForSetup } from "./config";
+import { defaultConfig, getConfigDir, getConfigPath, loadConfig, loadConfigForSetup } from "./config";
 import {
   inspectLauncherBrowserHost,
   inspectLauncherBrowserHostLiveness,
@@ -70,7 +70,6 @@ Setup options:
                                Use the embedded launcher browser described by this owner-only file
   --refresh-account-capabilities
                                Re-read the authenticated account's available Web models
-  --app-name NAME              Automatic-mode ChatGPT connector name (default: ${CHATGPT_CONNECTOR_NAME})
   --tunnel-id ID               Existing OpenAI tunnel id (full mode)
   --runtime-key-file PATH      File containing a Tunnels Read+Use runtime key
   --replace-codex-route        Reversibly replace existing Responses or Voice route settings
@@ -79,6 +78,8 @@ Setup options:
   --login                      Refresh the stored ChatGPT login even if one exists
   --auto-approve-tool-calls    Opt in to per-call browser clicks on "Allow once" prompts
   --bigger-context             Enable experimental adaptive 1/2/3-message context
+  --skill-attachments         Experimental selected skills as text attachments
+  --inline-skills             Keep selected skills inline (default)
   --standard-context           Disable experimental multi-message context
   --acknowledge-unofficial     Accept the one-time unofficial-browser-automation notice
 
@@ -287,7 +288,6 @@ async function setupCommand(args: string[]): Promise<void> {
     }
     options.subagentProtocol = subagentProtocol;
   }
-  const appName = takeOption(args, "--app-name");
   const tunnelId = takeOption(args, "--tunnel-id");
   const runtimeKeyFile = takeOption(args, "--runtime-key-file");
   const chrome = takeOption(args, "--chrome");
@@ -295,17 +295,20 @@ async function setupCommand(args: string[]): Promise<void> {
   if (chrome) options.chromeExecutablePath = chrome;
   if (browserHostDescriptorPath) options.browserHostDescriptorPath = browserHostDescriptorPath;
   options.refreshAccountCapabilities = takeFlag(args, "--refresh-account-capabilities");
-  if (appName) options.appName = appName;
   if (tunnelId) options.tunnelId = tunnelId;
   if (runtimeKeyFile) options.runtimeKeyFile = runtimeKeyFile;
   options.forceLogin = takeFlag(args, "--login");
   options.autoApproveToolCalls = takeFlag(args, "--auto-approve-tool-calls");
+  const skillAttachments = takeFlag(args, "--skill-attachments");
+  const inlineSkills = takeFlag(args, "--inline-skills");
+  if (skillAttachments && inlineSkills) throw new Error("Choose --skill-attachments or --inline-skills");
   const biggerContext = takeFlag(args, "--bigger-context");
   const standardContext = takeFlag(args, "--standard-context");
   if (biggerContext && standardContext) {
     throw new Error("Choose at most one context mode: --bigger-context or --standard-context");
   }
   if (biggerContext || standardContext) options.experimentalBiggerContext = biggerContext;
+  if (skillAttachments || inlineSkills) options.experimentalSkillAttachments = skillAttachments;
   const zeroRiskPro = takeFlag(args, "--zero-risk-pro");
   const zeroRiskDefault = takeFlag(args, "--zero-risk-default");
   if (zeroRiskPro && zeroRiskDefault) {

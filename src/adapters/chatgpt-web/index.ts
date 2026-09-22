@@ -28,7 +28,7 @@ import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt } from "./prompt
 import { createChatGptStructuredOutputValidator } from "./output-validation";
 import { chatGptWebTurnRetryPolicy } from "./retry-policy";
 import { TurnBroker, type BrokerToolRequest, type BrokerToolResult, type TurnBrokerOwner } from "./turn-broker";
-import { ChatGptTextFeed, ChatGptTraceFeed, chatGptCompactionSourceExecutionKey, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnRetryKey, chatGptTurnRoundKey, chatGptTurnSessions, type ChatGptBrowserOutcome, type ChatGptTraceEvent, type ChatGptTurnRuntime, type ChatGptTurnSession } from "./turn-execution";
+import { ChatGptTextFeed, ChatGptTraceFeed, chatGptCompactionSourceExecutionKey, chatGptInstructionLineage, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnRetryKey, chatGptTurnRoundKey, chatGptTurnSessions, type ChatGptBrowserOutcome, type ChatGptTraceEvent, type ChatGptTurnRuntime, type ChatGptTurnSession } from "./turn-execution";
 import { estimateChatGptWebUsage, resolveBiggerContextMultipartParts } from "./usage";
 import { ChatGptThreadEnvironmentStore } from "./thread-environment";
 import {
@@ -348,6 +348,13 @@ export function createChatGptWebAdapter(
   const zeroRiskManualControl = dependencies.zeroRiskManualControl ?? launcherZeroRiskManualControl;
   const structuredBroker = broker instanceof TurnBroker ? broker : undefined;
   const timeoutMs = provider.chatgptWeb?.turnTimeoutMs;
+  const experimentalSkillAttachments = provider.chatgptWeb?.experimentalSkillAttachments;
+  if (experimentalSkillAttachments !== undefined && typeof experimentalSkillAttachments !== "boolean") {
+    throw new Error("ChatGPT skill attachments preference must be a boolean");
+  }
+  if (experimentalSkillAttachments && provider.chatgptWeb?.browserInteractionMode === "manual") {
+    throw new Error("Skills as files is unavailable in Zero Risk mode");
+  }
   const experimentalBiggerContext = provider.chatgptWeb?.experimentalBiggerContext;
   if (experimentalBiggerContext !== undefined && typeof experimentalBiggerContext !== "boolean") {
     throw new Error("ChatGPT Bigger Context preference must be a boolean");
@@ -355,6 +362,7 @@ export function createChatGptWebAdapter(
   const configuredCapabilities: ChatGptWebCapabilities = {
     localToolsEnabled: provider.chatgptWeb?.localToolsEnabled === true,
     solAvailable: provider.chatgptWeb?.solAvailable !== false,
+    extraHighAvailable: provider.chatgptWeb?.extraHighAvailable === true,
     proAvailable: provider.chatgptWeb?.proAvailable === true,
   };
   const manualInteraction = provider.chatgptWeb?.browserInteractionMode === "manual";
@@ -430,10 +438,11 @@ export function createChatGptWebAdapter(
     const compileOptionsFor = (input: CodexParsedRequest) => {
       if (manualRequest) return {};
       const experimentalMultipartParts = experimentalBiggerContext
-        ? resolveBiggerContextMultipartParts(input, turnCapabilities)
+        ? resolveBiggerContextMultipartParts(input, turnCapabilities, experimentalSkillAttachments)
         : undefined;
       return {
         captureLunaCheckpoint,
+        experimentalSkillAttachments,
         ...(experimentalMultipartParts !== undefined
           ? { experimentalMultipartParts }
           : {}),
@@ -718,11 +727,6 @@ export function createChatGptWebAdapter(
         traceId,
       );
       activeToken = turnToken;
-      observeCapabilityRetirement(turnToken, externalProgress);
-      if (!tokenSettled) {
-        tokenSettled = true;
-        token.resolve(turnToken);
-      }
       try {
         const compiled = compileChatGptWebPrompt(
           input,
@@ -730,6 +734,13 @@ export function createChatGptWebAdapter(
           turnToken,
           compileOptionsFor(input),
         );
+        // Publish only after preparation succeeds: otherwise its failure revokes the token
+        // before the response observer uses it and masks the cause as an expired capability.
+        observeCapabilityRetirement(turnToken, externalProgress);
+        if (!tokenSettled) {
+          tokenSettled = true;
+          token.resolve(turnToken);
+        }
         return { ...compiled, release: () => {} };
       } catch (error) {
         await broker.revoke(turnToken);
@@ -1083,12 +1094,15 @@ export function createChatGptWebAdapter(
               }
               const handoffError = error instanceof Error ? error : new Error(String(error));
               console.error("[chatgpt-web] structured context handoff failed:", handoffError);
+              const upstreamError = handoffError instanceof ChatGptWebAdapterError ? handoffError : undefined;
               emit({
                 type: "error",
-                message: "ChatGPT did not complete the context handoff. Retry the task.",
-                status: 409,
-                errorType: "invalid_request_error",
-                code: "compaction_handoff_failed",
+                message: upstreamError?.message ?? "ChatGPT did not complete the context handoff. Retry the task.",
+                status: upstreamError?.status ?? 409,
+                errorType: upstreamError?.errorType ?? "invalid_request_error",
+                code: upstreamError?.code ?? "compaction_handoff_failed",
+                // Compaction retry remains an explicit operator decision even when its source
+                // failure was retryable; preserve the cause without opening a new retry loop.
                 retryable: false,
               });
               return;
@@ -1096,7 +1110,7 @@ export function createChatGptWebAdapter(
             emit({ type: "text_delta", text: summary, phase: "final_answer" });
             emitBrowserCompletion(
               { type: "final", answer: summary },
-              estimateChatGptWebUsage(parsed, { answer: summary, reasoning: [] }, turnCapabilities),
+              estimateChatGptWebUsage(parsed, { answer: summary, reasoning: [] }, turnCapabilities, experimentalBiggerContext, experimentalSkillAttachments),
               emit,
             );
             chatGptWebTurnRetryPolicy.clear(retryKey);
@@ -1123,6 +1137,7 @@ export function createChatGptWebAdapter(
           incoming.abortSignal,
           nativeTurnId,
           nativeIdentity.threadId,
+          chatGptInstructionLineage(parsed),
         );
         const roundKey = chatGptTurnRoundKey(parsed);
         const emitRoundEvents = (events: readonly AdapterEvent[]): void => {
@@ -1188,7 +1203,7 @@ export function createChatGptWebAdapter(
               session.setFinalEvents(session.roundEvents(roundKey));
               emitRoundBatch(buffer => emitBrowserCompletion(
                 settled,
-                estimateChatGptWebUsage(currentUsageInput(parsed), { answer: settled.answer, reasoning }, turnCapabilities),
+                estimateChatGptWebUsage(currentUsageInput(parsed), { answer: settled.answer, reasoning }, turnCapabilities, experimentalBiggerContext, experimentalSkillAttachments),
                 buffer,
               ));
               session.completeRound(roundKey);
@@ -1210,7 +1225,7 @@ export function createChatGptWebAdapter(
                   if (replay.length === 0) emitRoundEvents(session.eventsForOutstandingReplay());
                   emitRoundBatch(buffer => emitToolBatch(
                     outstanding,
-                    estimateChatGptWebUsage(currentUsageInput(parsed), { reasoning, toolRequests: outstanding }, turnCapabilities),
+                    estimateChatGptWebUsage(currentUsageInput(parsed), { reasoning, toolRequests: outstanding }, turnCapabilities, experimentalBiggerContext, experimentalSkillAttachments),
                     buffer,
                   ));
                   session.completeRound(roundKey);
@@ -1294,7 +1309,7 @@ export function createChatGptWebAdapter(
                 }
                 emitRoundBatch(buffer => emitBrowserCompletion(
                   completedOutcome,
-                  estimateChatGptWebUsage(currentUsageInput(parsed), { answer: completedOutcome.answer, reasoning: roundReasoning }, turnCapabilities),
+                  estimateChatGptWebUsage(currentUsageInput(parsed), { answer: completedOutcome.answer, reasoning: roundReasoning }, turnCapabilities, experimentalBiggerContext, experimentalSkillAttachments),
                   buffer,
                 ));
                 session.completeRound(roundKey);
@@ -1352,7 +1367,7 @@ export function createChatGptWebAdapter(
                 session.setOutstanding(next.requests, roundReasoning, session.roundEvents(roundKey));
                 emitRoundBatch(buffer => emitToolBatch(
                   next.requests,
-                  estimateChatGptWebUsage(currentUsageInput(parsed), { reasoning: roundReasoning, toolRequests: next.requests }, turnCapabilities),
+                  estimateChatGptWebUsage(currentUsageInput(parsed), { reasoning: roundReasoning, toolRequests: next.requests }, turnCapabilities, experimentalBiggerContext, experimentalSkillAttachments),
                   buffer,
                 ));
                 session.completeRound(roundKey);
